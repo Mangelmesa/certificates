@@ -25,12 +25,14 @@ import (
 	"strings"
 	"time"
 
+	_ "os"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/go-tpm/legacy/tpm2"
 	"golang.org/x/exp/slices"
 
 	"github.com/smallstep/go-attestation/attest"
-
+	"io/ioutil"
+	
 	"go.step.sm/crypto/jose"
 	"go.step.sm/crypto/keyutil"
 	"go.step.sm/crypto/pemutil"
@@ -354,32 +356,45 @@ type attestationObject struct {
 
 // TODO(bweeks): move attestation verification to a shared package.
 func deviceAttest01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSONWebKey, payload []byte) error {
+	fmt.Print("\nEntered DeviceAttest01Validate\n")
 	// Load authorization to store the key fingerprint.
 	az, err := db.GetAuthorization(ctx, ch.AuthorizationID)
 	if err != nil {
 		return WrapErrorISE(err, "error loading authorization")
 	}
-
-	// Parse payload.
+	//fmt.Printf("\n Payload: %x \n",payload)
+	
+	// Parse payload: This works with req from client.go
 	var p payloadType
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return WrapErrorISE(err, "error unmarshalling JSON")
 	}
-	if p.Error != "" {
-		return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
-			"payload contained error: %v", p.Error))
-	}
-
-	attObj, err := base64.RawURLEncoding.DecodeString(p.AttObj)
+	//fmt.Printf("\n p: %x \n",p)
+	
+	//This is supposed to be the payload that was sent:
+	attObj, err := base64.StdEncoding.DecodeString(p.AttObj) 
 	if err != nil {
-		return WrapErrorISE(err, "error base64 decoding attObj")
+		return WrapErrorISE(err, "error base64 decoding attObj 1")
+	}		
+	//fmt.Printf("\n attObj: %x \n",attObj)
+	
+	//Had to add this for proper parse the payload:
+	var p2 payloadType
+	json.Unmarshal(attObj, &p2)
+	//fmt.Printf("\n p2: %x \n", p2)
+	//fmt.Printf("\n p2.AttObj: %x \n", p2.AttObj)
+
+	data, err := base64.RawURLEncoding.DecodeString(p2.AttObj)
+	if err != nil {
+		return WrapErrorISE(err, "error base64 decoding attObj 2")
 	}
+	//fmt.Printf("\n AttObj_correct: %x \n", data)
 
 	att := attestationObject{}
-	if err := cbor.Unmarshal(attObj, &att); err != nil {
+	if err := cbor.Unmarshal(data, &att); err != nil {
 		return WrapErrorISE(err, "error unmarshalling CBOR")
-	}
-
+	}	
+	
 	format := att.Format
 	prov := MustProvisionerFromContext(ctx)
 	if !prov.IsAttestationFormatEnabled(ctx, provisioner.ACMEAttestationFormat(format)) {
@@ -393,6 +408,9 @@ func deviceAttest01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose
 
 	switch format {
 	case "apple":
+			fmt.Print("\n\n")
+		fmt.Print("\nEntered the APPLE case\n")
+		fmt.Print("\n\n")
 		data, err := doAppleAttestationFormat(ctx, prov, ch, &att)
 		if err != nil {
 			var acmeError *Error
@@ -429,6 +447,9 @@ func deviceAttest01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose
 		// Update attestation key fingerprint to compare against the CSR
 		az.Fingerprint = data.Fingerprint
 	case "step":
+			fmt.Print("\n\n")
+		fmt.Print("\nEntered the STEP case\n")
+		fmt.Print("\n\n")
 		data, err := doStepAttestationFormat(ctx, prov, ch, jwk, &att)
 		if err != nil {
 			var acmeError *Error
@@ -458,6 +479,7 @@ func deviceAttest01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose
 		az.Fingerprint = data.Fingerprint
 
 	case "tpm":
+		fmt.Print("\nEntered the TPM case\n")
 		data, err := doTPMAttestationFormat(ctx, prov, ch, jwk, &att)
 		if err != nil {
 			var acmeError *Error
@@ -532,6 +554,7 @@ const (
 )
 
 func doTPMAttestationFormat(_ context.Context, prov Provisioner, ch *Challenge, jwk *jose.JSONWebKey, att *attestationObject) (*tpmAttestationData, error) {
+	fmt.Print("\nChecking the TPM Attestation Format...\n")
 	ver, ok := att.AttStatement["ver"].(string)
 	if !ok {
 		return nil, NewDetailedError(ErrorBadAttestationStatementType, "ver not present")
@@ -584,26 +607,34 @@ func doTPMAttestationFormat(_ context.Context, prov Provisioner, ch *Challenge, 
 		akCert.UnhandledCriticalExtensions = unhandledCriticalExtensions
 	}
 
+	//Removed this in favor of loading the certpool. TODO: Remove this comments and check if
+	//it can work adding the attestation root to ca.json config file.
+	/*
 	roots, ok := prov.GetAttestationRoots()
 	if !ok {
 		return nil, NewErrorISE("no root CA bundle available to verify the attestation certificate")
 	}
-
-	// verify that the AK certificate was signed by a trusted root,
-	// chained to by the intermediates provided by the client. As part
-	// of building the verified certificate chain, the signature over the
-	// AK certificate is checked to be a valid signature of one of the
-	// provided intermediates. Signatures over the intermediates are in
-	// turn also verified to be valid signatures from one of the trusted
-	// roots.
+	*/
+	roots := x509.NewCertPool()
+    pemData, err := ioutil.ReadFile("acme/db/RootCertificate.pem")
+    if err != nil{
+			fmt.Print("Error opening CARoot.pem file")
+		}
+    if ok := roots.AppendCertsFromPEM(pemData); !ok {
+            fmt.Print("Error appending cert to pool")
+    }
+	// verify that the AK certificate was signed by a trusted root, chained to by the intermediates provided by the client. As part
+	// of building the verified certificate chain, the signature over the AK certificate is checked to be a valid signature of one of the
+	// provided intermediates. Signatures over the intermediates are in turn also verified to be valid signatures from one of the trusted roots.
 	verifiedChains, err := akCert.Verify(x509.VerifyOptions{
 		Roots:         roots,
 		Intermediates: intermediates,
 		CurrentTime:   time.Now().Truncate(time.Second),
 		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
 	})
+	
 	if err != nil {
-		return nil, WrapDetailedError(ErrorBadAttestationStatementType, err, "x5c is not valid")
+		return nil, WrapDetailedError(ErrorBadAttestationStatementType, err, "x5c is not valid!!")
 	}
 
 	// validate additional AK certificate requirements
@@ -677,22 +708,24 @@ func doTPMAttestationFormat(_ context.Context, prov Provisioner, ch *Challenge, 
 	if err = certificationParameters.Verify(verifyOpts); err != nil {
 		return nil, WrapDetailedError(ErrorBadAttestationStatementType, err, "invalid certification parameters")
 	}
-
 	// decode the "certInfo" data. This won't fail, as it's also done as part of Verify().
 	tpmCertInfo, err := tpm2.DecodeAttestationData(certInfo)
 	if err != nil {
 		return nil, WrapDetailedError(ErrorBadAttestationStatementType, err, "failed decoding attestation data")
 	}
-
-	keyAuth, err := KeyAuthorization(ch.Token, jwk)
+	
+if err != nil {
+	fmt.Print("\nError loading JWK for testing\n")
+}
+	keyAuth, err := KeyAuthorization(ch.Token, jwk) //OG
 	if err != nil {
 		return nil, WrapErrorISE(err, "failed creating key auth digest")
 	}
 	hashedKeyAuth := sha256.Sum256([]byte(keyAuth))
 
-	// verify the WebAuthn object contains the expect key authorization digest, which is carried
+	// verify the WebAuthn object contains the expected key authorization digest, which is carried
 	// within the encoded `certInfo` property of the attestation statement.
-	if subtle.ConstantTimeCompare(hashedKeyAuth[:], []byte(tpmCertInfo.ExtraData)) == 0 {
+	if subtle.ConstantTimeCompare(hashedKeyAuth[:], []byte(tpmCertInfo.ExtraData)) == 0 {	//Secure compare of 2 byte slices 
 		return nil, NewDetailedError(ErrorBadAttestationStatementType, "key authorization invalid")
 	}
 
